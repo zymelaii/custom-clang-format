@@ -19,6 +19,7 @@
 #include "clang/Basic/OperatorPrecedence.h"
 #include "clang/Format/Format.h"
 #include "clang/Lex/Lexer.h"
+#include <optional>
 #include <unordered_set>
 
 namespace clang {
@@ -630,6 +631,13 @@ public:
   ///    0: no braces
   ///   >0: number of right braces
   int8_t BraceCount = 0;
+
+  /// Custom rule: if set, this '*'/'&' has to be aligned according to this
+  /// value instead of the pointer or reference alignment of the style. It is
+  /// used to attach '*' and '&' to the type on their left in function return
+  /// types, template arguments and isolated types.
+  std::optional<FormatStyle::PointerAlignmentStyle>
+      ForcedPointerOrReferenceAlignment;
 
   /// If this token starts a block, this contains all the unwrapped lines
   /// in it.

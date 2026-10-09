@@ -270,6 +270,20 @@ private:
   FormatStyle::PointerAlignmentStyle getTokenPointerOrReferenceAlignment(
       const FormatToken &PointerOrReference) const;
 
+  /// Custom rule: returns \c true if the '*' or '&' token \p PointerOrReference
+  /// must be attached to the type on its left, overriding the pointer and
+  /// reference alignment configured in the style.
+  ///
+  /// This is deliberately not configurable, so that this rule cannot be undone
+  /// by a .clang-format file. It applies to
+  ///  - the return type of a function declaration or definition,
+  ///  - template arguments,
+  ///  - isolated types, i.e. types that are not part of the declarator of a
+  ///    variable, function or parameter.
+  bool mustAttachPointerOrReferenceToType(const AnnotatedLine &Line,
+                                          const FormatToken &PointerOrReference,
+                                          const FormatToken &Left) const;
+
   const FormatStyle &Style;
 
   bool IsCpp;

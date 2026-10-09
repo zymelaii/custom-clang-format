@@ -4274,6 +4274,20 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
     First->MustBreakBefore = true;
   }
 
+  // Custom rule: attach '*' and '&' to the type on their left for function
+  // return types, template arguments and isolated types. The decision is taken
+  // before the spacing is computed, because spaceRequiredBefore() and
+  // getTokenPointerOrReferenceAlignment() consult it for the '*'/'&' as well as
+  // for the token following it. It overrides the pointer and reference
+  // alignment selected in the style, so that the rule holds independently of
+  // the .clang-format configuration in use.
+  for (auto *Current = First; Current; Current = Current->Next) {
+    Current->ForcedPointerOrReferenceAlignment.reset();
+    if (Current->is(TT_PointerOrReference) && Current->Previous &&
+        mustAttachPointerOrReferenceToType(Line, *Current, *Current->Previous))
+      Current->ForcedPointerOrReferenceAlignment = FormatStyle::PAS_Left;
+  }
+
   bool InFunctionDecl = Line.MightBeFunctionDecl;
   bool InParameterList = false;
   for (auto *Current = First->Next; Current; Current = Current->Next) {
@@ -4317,6 +4331,9 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
       Current->SpacesRequiredBefore = 1;
     }
 
+
+
+
     const auto &Children = Prev->Children;
     if (!Children.empty() && Children.back()->Last->is(TT_LineComment)) {
       Current->MustBreakBefore = true;
@@ -4344,6 +4361,11 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
                                      TT_PointerOrReference)) {
       Current->CanBreakBefore = false;
     }
+
+    // Custom rule: '*' and '&' that have to be attached to the type on their
+    // left must not be preceded by a space.
+    if (Current->ForcedPointerOrReferenceAlignment == FormatStyle::PAS_Left)
+      Current->SpacesRequiredBefore = 0;
 
     unsigned ChildSize = 0;
     if (Prev->Children.size() == 1) {
@@ -6822,10 +6844,300 @@ TokenAnnotator::getTokenReferenceAlignment(const FormatToken &Reference) const {
 FormatStyle::PointerAlignmentStyle
 TokenAnnotator::getTokenPointerOrReferenceAlignment(
     const FormatToken &PointerOrReference) const {
+  // Custom rule: a '*'/'&' that has to be attached to the type on its left is
+  // left aligned, no matter what the style says.
+  if (PointerOrReference.ForcedPointerOrReferenceAlignment)
+    return *PointerOrReference.ForcedPointerOrReferenceAlignment;
   if (PointerOrReference.isOneOf(tok::amp, tok::ampamp))
     return getTokenReferenceAlignment(PointerOrReference);
   assert(PointerOrReference.is(tok::star));
   return Style.PointerAlignment;
+}
+
+//===----------------------------------------------------------------------===//
+// Custom pointer/reference attachment rules.
+//
+// These rules force '*' and '&' to bind to the type on their left in the three
+// situations described in mustAttachPointerOrReferenceToType(). They are not
+// driven by the style, so that no .clang-format file can turn them off.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Returns the identifier that declares the function name on \p Line, e.g.
+/// \c foo in `const char *foo(int);`, and the parenthesis that opens its
+/// parameter list. Returns \c nullptr if \p Line does not declare a function
+/// (or cannot be recognized as one).
+const FormatToken *findFunctionDeclName(const AnnotatedLine &Line,
+                                        const FormatToken *&ParamList) {
+  ParamList = nullptr;
+  const auto *const LineFirst = Line.getFirstNonComment();
+  const auto *const LineLast = Line.getLastNonComment();
+  if (!LineFirst || !LineLast)
+    return nullptr;
+
+  for (const auto *Tok = LineFirst; Tok; Tok = Tok->Next) {
+    if (Tok->isOneOf(TT_CtorDtorDeclName, tok::tilde))
+      // Constructors and destructors do not have a return type.
+      return nullptr;
+    if (Tok->is(tok::kw_operator))
+      // An overloaded operator name, e.g. `void *operator&()`, holds a '*' or
+      // '&' that must not be mistaken for a return type.
+      return nullptr;
+    if (Tok->is(TT_TrailingReturnArrow))
+      // A trailing return type, `auto f() -> T *`, is not affected.
+      return nullptr;
+
+    // A function declaration name is the last identifier in front of the
+    // parenthesis that opens its parameter list. Using the last one also
+    // handles qualified names, as in `X *Y::f()`.
+    if (Tok->is(tok::l_paren) && Tok->MatchingParen) {
+      const auto *Name = Tok->getPreviousNonComment();
+      if (!Name || Name->isNot(tok::identifier) ||
+          Name->NestingLevel != Tok->NestingLevel)
+        return nullptr;
+      // A call, as in `api->disasm(...)` or `int *p = f(x);`, has an operator
+      // in front of the name where a declaration has its type.
+      for (const auto *Before = LineFirst; Before && Before != Name;
+           Before = Before->Next) {
+        if (Before->NestingLevel != Tok->NestingLevel)
+          continue;
+        if (Before->is(TT_BinaryOperator))
+          return nullptr;
+      }
+      ParamList = Tok;
+      return Name;
+    }
+
+    // Skip over constructs that cannot contain the function name, such as
+    // attributes or template argument lists in the return type. Never walk
+    // past the end of the line.
+    if (Tok->MatchingParen && Tok->MatchingParen->isNot(tok::r_paren)) {
+      Tok = Tok->MatchingParen;
+      if (Tok == LineLast)
+        break;
+    } else if (Tok == LineLast) {
+      break;
+    }
+  }
+  return nullptr;
+}
+
+/// Returns \c true if the token in front of \p Left indicates that the '*'/'&'
+/// that follows \p Left starts a return type.
+bool isReturnTypeStart(const FormatToken &Left, const LangOptions &LangOpts) {
+  // A '(' or '::' directly on the left means that the '*'/'&' belongs to a
+  // declarator (as in `void (*func)(...)`) or to an operator name rather than
+  // to the return type.
+  const auto *const BeforeLeft = Left.getPreviousNonComment();
+  if (!BeforeLeft ||
+      BeforeLeft->isOneOf(tok::l_paren, tok::l_square, tok::coloncolon))
+    return false;
+
+  // Walk backwards to the start of the declaration. Since the token in front
+  // of the '*'/'&' is separated from it by a space, the '*'/'&' is part of the
+  // return type.
+  for (const auto *Tok = BeforeLeft; Tok; Tok = Tok->getPreviousNonComment()) {
+    if (Tok->is(tok::kw_operator))
+      return false;
+    if (Tok->isOneOf(tok::semi, tok::l_brace, tok::r_brace))
+      break;
+    if (Tok->is(TT_TrailingReturnArrow))
+      return false;
+    if (Tok->isPointerOrReference() || Tok->canBePointerOrReferenceQualifier())
+      continue;
+    if (Tok->isTypeName(LangOpts) || Tok->is(tok::identifier) ||
+        Tok->is(tok::coloncolon) || Tok->is(tok::kw_auto) ||
+        Tok->is(TT_TemplateCloser))
+      continue;
+    break;
+  }
+  return true;
+}
+
+/// Returns \c true if \p PointerOrReference belongs to the return type of the
+/// function declared by \p Line.
+bool isFunctionReturnTypePointerOrReference(
+    const AnnotatedLine &Line, const FormatToken &Left,
+    const FormatToken &PointerOrReference, const LangOptions &LangOpts) {
+  // A '*'/'&' that is part of the return type is separated from the token
+  // following it by a space, as in `const char *foo()`. Without that space the
+  // '*'/'&' is attached to a declarator, as in `void (*foo)()` or `char *foo`.
+  if (!PointerOrReference.Next ||
+      !PointerOrReference.Next->hasWhitespaceBefore())
+    return false;
+
+  const FormatToken *ParamList = nullptr;
+  if (findFunctionDeclName(Line, ParamList) == nullptr)
+    return false;
+
+  // The 'name(' found above may also be a function call in an initializer, as
+  // in `int *p = f(x);`. Only declarations have a return type, so reject lines
+  // in which the initializer or another expression starts before the name.
+  if (!Line.MightBeFunctionDecl)
+    return false;
+  for (const auto *Tok = Line.getFirstNonComment(); Tok && Tok != ParamList;
+       Tok = Tok->Next) {
+    if (Tok->NestingLevel != ParamList->NestingLevel)
+      continue;
+    if (Tok->is(tok::equal) || Tok->is(TT_StartOfName))
+      return false;
+  }
+
+  const FormatToken *const DeclName = ParamList->getPreviousNonComment();
+  if (!DeclName || PointerOrReference.NestingLevel != DeclName->NestingLevel)
+    return false;
+
+  // The return type ends where the parameter list of the function begins, so a
+  // '*'/'&' behind the function name belongs to a declarator or a parameter
+  // instead, as in `void (*foobarpntr)(int *, char *)`.
+  for (const auto *Tok = Line.First; Tok && Tok != DeclName; Tok = Tok->Next) {
+    if (Tok == &PointerOrReference)
+      return isReturnTypeStart(Left, LangOpts);
+  }
+  return false;
+}
+
+/// Returns \c true if \p PointerOrReference is written within the template
+/// argument list of a template specialization, e.g. the '*' in `foo<const
+/// char *>` or the one in `std::function<void(void *)>`. Template parameter
+/// lists, as in `template <int *P>`, declare a name and are therefore not
+/// considered.
+bool isInTemplateArgumentList(const FormatToken &PointerOrReference) {
+  // Walk up through the enclosing bracket scopes. A '<' that is still open at
+  // the level of the current token encloses it.
+  for (unsigned Level = PointerOrReference.NestingLevel;; --Level) {
+    const auto *Opener = PointerOrReference.getPreviousNonComment();
+    for (; Opener; Opener = Opener->getPreviousNonComment()) {
+      if (Opener->isOneOf(tok::semi, tok::l_brace, tok::r_brace))
+        return false;
+      if (Opener->NestingLevel + 1 == Level && Opener->opensScope())
+        break;
+    }
+    if (!Opener)
+      return false;
+    // Inside a parameter list the annotator may not recognize a template
+    // opener, so also accept a '<' that has a matching '>'.
+    if ((Opener->is(TT_TemplateOpener) ||
+         (Opener->is(tok::less) && Opener->MatchingParen &&
+          Opener->MatchingParen->is(tok::greater))) &&
+        Opener->MatchingParen && Opener->MatchingParen->NestingLevel == Level) {
+      // `template <` opens a template parameter list rather than an argument
+      // list.
+      if (Opener->Previous && Opener->Previous->is(tok::kw_template))
+        return false;
+      return true;
+    }
+    if (Level == 0)
+      return false;
+  }
+}
+
+/// Returns \c true if \p Tok is part of a type, i.e. if it is a type name, a
+/// template closure, a qualification of one of those, or a template parameter
+/// such as the `T` in `const T *`.
+bool isTypeToken(const FormatToken &Tok, const LangOptions &LangOpts) {
+  return Tok.isTypeName(LangOpts) || Tok.is(tok::identifier) ||
+         Tok.is(tok::coloncolon) || Tok.is(TT_TemplateCloser);
+}
+
+/// Returns \c true if \p PointerOrReference completes an abstract type, i.e. if
+/// the '*'/'&' is not attached to a name. This is the case for isolated types
+/// such as the `void (*)(const char *)` in `using T = void (*)(const char *);`.
+bool isIsolatedTypePointerOrReference(const AnnotatedLine &Line,
+                                      const FormatToken &PointerOrReference,
+                                      const LangOptions &LangOpts) {
+  const auto *Next = PointerOrReference.getNextNonComment();
+  if (!Next)
+    return false;
+
+  // `char *const` is an abstract type even though it is followed by a name.
+  if (Next->canBePointerOrReferenceQualifier())
+    Next = Next->getNextNonComment();
+  if (!Next)
+    return false;
+
+  if (!Next->Tok.isAnyIdentifier())
+    return true;
+
+  // An identifier behind the '*'/'&' may either be the name of a declarator, as
+  // in `char *name`, or a type, as in `const T *` or as in
+  // `void (*)(const char *p)`. The name of a declarator is followed by the end
+  // of the declaration, by another declarator, or by an initializer:
+  const auto *AfterName = Next->getNextNonComment();
+  if (!AfterName)
+    return false;
+  if (AfterName->isPointerOrReference() ||
+      AfterName->isOneOf(tok::semi, tok::comma, tok::r_paren, tok::r_square,
+                         tok::l_brace, tok::equal))
+    return false;
+  return isTypeToken(*AfterName, LangOpts) &&
+         AfterName->isNot(TT_FunctionTypeLParen);
+}
+
+/// Returns \c true if \p PointerOrReference is part of the parameter list of the
+/// function declared by \p Line, as in `int f(char *arg)`. Such a '*'/'&' is
+/// part of a declarator or of an abstract parameter type and is left to the
+/// pointer and reference alignment of the style.
+bool isInFunctionParameterList(const AnnotatedLine &Line,
+                               const FormatToken &PointerOrReference) {
+  const FormatToken *ParamList = nullptr;
+  if (findFunctionDeclName(Line, ParamList) == nullptr || !ParamList)
+    return false;
+
+  // The parameter list is nested more deeply than the function name.
+  if (PointerOrReference.NestingLevel <= ParamList->NestingLevel)
+    return false;
+
+  // The token has to appear behind the parenthesis that opens the list.
+  for (const auto *Tok = ParamList; Tok; Tok = Tok->Next) {
+    if (Tok == &PointerOrReference)
+      return true;
+    if (Tok->NestingLevel < ParamList->NestingLevel)
+      return false;
+  }
+  return false;
+}
+
+} // namespace
+
+bool TokenAnnotator::mustAttachPointerOrReferenceToType(
+    const AnnotatedLine &Line, const FormatToken &PointerOrReference,
+    const FormatToken &Left) const {
+  // The rule is about C++ (and Objective-C++) declarations only. Other
+  // languages, such as Verilog, use '*' and '&' for unrelated purposes.
+  if (!IsCpp)
+    return false;
+  if (!PointerOrReference.isOneOf(tok::star, tok::amp, tok::ampamp))
+    return false;
+  // A '*' that starts a block comment, as in `(* comment *)` in Verilog, or
+  // that is followed by one, is not part of a type.
+  if (Left.is(TT_BlockComment) || PointerOrReference.Next == nullptr ||
+      PointerOrReference.Next->is(TT_BlockComment))
+    return false;
+  // `const auto &[a, b]` is a structured binding, i.e. a declaration, and is
+  // left to the pointer and reference alignment of the style.
+  if (PointerOrReference.Next->isOneOf(tok::l_square, tok::r_square))
+    return false;
+
+  // 1. The return type of a function declaration or definition, except for
+  //    trailing return types such as `auto f() -> const T *`.
+  if (isFunctionReturnTypePointerOrReference(Line, Left, PointerOrReference,
+                                             LangOpts))
+    return true;
+
+  // 2. Template arguments take precedence over the parameter list exception
+  //    below, so that `std::function<void(void *)>` is compacted even inside a
+  //    parameter list.
+  if (isInTemplateArgumentList(PointerOrReference))
+    return true;
+
+  // 3. Isolated types, i.e. types that are not part of the declarator of a
+  //    variable, function or parameter. Note that `void (*func)(char *var)` is
+  //    a variable definition and therefore not covered by this rule.
+  if (isInFunctionParameterList(Line, PointerOrReference))
+    return false;
+  return isIsolatedTypePointerOrReference(Line, PointerOrReference, LangOpts);
 }
 
 } // namespace format
