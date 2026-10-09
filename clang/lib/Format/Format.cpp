@@ -2716,6 +2716,62 @@ private:
   }
 };
 
+// Custom rule: an empty lambda parameter list is removed, so that `[]() {...}`
+// becomes `[] {...}`. A parameter list that is followed by something other than
+// the body, as in `[]() mutable {...}` or `[]() -> int {...}`, is kept.
+class LambdaParensRemover : public TokenAnalyzer {
+public:
+  LambdaParensRemover(const Environment &Env, const FormatStyle &Style)
+      : TokenAnalyzer(Env, Style) {}
+
+  std::pair<tooling::Replacements, unsigned>
+  analyze(TokenAnnotator &Annotator,
+          SmallVectorImpl<AnnotatedLine *> &AnnotatedLines,
+          FormatTokenLexer &Tokens) override {
+    AffectedRangeMgr.computeAffectedLines(AnnotatedLines);
+    if (!Style.isCpp())
+      return {tooling::Replacements(), 0};
+    tooling::Replacements Result;
+    removeEmptyLambdaParens(AnnotatedLines, Result);
+    return {Result, 0};
+  }
+
+private:
+  void removeEmptyLambdaParens(SmallVectorImpl<AnnotatedLine *> &Lines,
+                               tooling::Replacements &Result) {
+    const auto &SourceMgr = Env.getSourceManager();
+    for (AnnotatedLine *Line : Lines) {
+      if (!Line->Children.empty())
+        removeEmptyLambdaParens(Line->Children, Result);
+      if (!Line->Affected)
+        continue;
+      for (const FormatToken *Token = Line->First; Token;
+           Token = Token->Next) {
+        if (Token->isNot(TT_LambdaLSquare) || !Token->MatchingParen)
+          continue;
+        const FormatToken *LParen = Token->MatchingParen->getNextNonComment();
+        if (!LParen || LParen->isNot(tok::l_paren))
+          continue;
+        // The parameter list has to be empty: the ')' must follow the '(' with
+        // nothing but comments in between.
+        const FormatToken *RParen = LParen->Next;
+        while (RParen && RParen->is(tok::comment))
+          RParen = RParen->Next;
+        if (!RParen || RParen->isNot(tok::r_paren))
+          continue;
+        // Only remove the parameter list if the body follows directly.
+        const FormatToken *After = RParen->getNextNonComment();
+        if (!After || After->isNot(TT_LambdaLBrace))
+          continue;
+        const auto Range =
+            CharSourceRange::getCharRange(LParen->Tok.getLocation(),
+                                          RParen->Tok.getEndLoc());
+        cantFail(Result.add(tooling::Replacement(SourceMgr, Range, "")));
+      }
+    }
+  }
+};
+
 class BracesInserter : public TokenAnalyzer {
 public:
   BracesInserter(const Environment &Env, const FormatStyle &Style)
@@ -4462,6 +4518,15 @@ reformat(const FormatStyle &Style, StringRef Code,
   Passes.emplace_back([&](const Environment &Env) {
     return Formatter(Env, Expanded, Status).process();
   });
+
+  if (Style.isCpp()) {
+    // Custom rule: remove the parameter list of lambdas that do not declare any
+    // parameter. This runs after the main formatter so that it sees the
+    // formatted token stream.
+    Passes.emplace_back([&](const Environment &Env) {
+      return LambdaParensRemover(Env, Expanded).process();
+    });
+  }
 
   if (Style.SeparateDefinitionBlocks != FormatStyle::SDS_Leave) {
     Passes.emplace_back([&](const Environment &Env) {

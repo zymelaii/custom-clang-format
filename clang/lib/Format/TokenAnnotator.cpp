@@ -4140,6 +4140,284 @@ static FormatToken *findReturnTypeStart(const AnnotatedLine &Line) {
   return Tok;
 }
 
+//===----------------------------------------------------------------------===//
+// Custom lambda rules.
+//
+// 1. A lambda whose body holds at most one statement is always kept on a single
+//    line.
+// 2. An empty lambda parameter list is removed (see LambdaParensRemover in
+//    Format.cpp).
+// 3. A lambda that is assigned to a variable, or that is immediately invoked,
+//    and that has more than one statement is broken so that its braces sit on
+//    their own line at the indentation of the current scope.
+// 4. A lambda that is an argument of a call and that fits the column limit in
+//    the current line is kept inline.
+//
+// None of this is configurable, so no .clang-format file can turn it off.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Returns \c true if \p Tok is an assignment.
+bool isAssignmentToken(const FormatToken &Tok) {
+  return Tok.is(tok::equal) ||
+         (Tok.is(TT_BinaryOperator) &&
+          Tok.getPrecedence() == prec::Assignment);
+}
+
+/// Returns \c true if the lambda introduced by \p Introducer is assigned to a
+/// variable, as in `auto f = [](...) {...};`.
+bool isAssignedLambda(const FormatToken &Introducer) {
+  for (const auto *Tok = Introducer.getPreviousNonComment(); Tok;
+       Tok = Tok->getPreviousNonComment()) {
+    if (Tok->NestingLevel < Introducer.NestingLevel)
+      break;
+    if (Tok->NestingLevel != Introducer.NestingLevel)
+      continue;
+    if (isAssignmentToken(*Tok))
+      return true;
+    if (Tok->isOneOf(tok::semi, tok::l_brace, tok::r_brace))
+      break;
+  }
+  return false;
+}
+
+/// Returns \c true if the lambda introduced by \p Introducer is immediately
+/// invoked, as in `auto f = [](...) {...}(...);`.
+bool isImmediatelyInvokedLambda(const FormatToken &Introducer) {
+  // Walk to the body's opening brace and from there to its closing brace.
+  const FormatToken *Body = Introducer.MatchingParen;
+  for (; Body && Body->isNot(tok::l_brace); Body = Body->Next) {
+  }
+  if (!Body || Body->isNot(TT_LambdaLBrace) || !Body->MatchingParen)
+    return false;
+  const FormatToken *Next = Body->MatchingParen->getNextNonComment();
+  return Next && Next->is(tok::l_paren) &&
+         Next->NestingLevel == Introducer.NestingLevel;
+}
+
+/// Returns \c true if the lambda introduced by \p Introducer is an argument,
+/// i.e. if it is directly nested in an enclosing parenthesis.
+bool isLambdaCallArgument(const FormatToken &Introducer) {
+  const unsigned Level = Introducer.NestingLevel;
+  const FormatToken *Enclosing = nullptr;
+  for (const auto *Tok = Introducer.getPreviousNonComment(); Tok;
+       Tok = Tok->getPreviousNonComment()) {
+    if (Tok->NestingLevel < Level) {
+      Enclosing = Tok;
+      break;
+    }
+  }
+  return Enclosing && Enclosing->is(tok::l_paren) &&
+         Enclosing->MatchingParen != nullptr;
+}
+
+/// Counts the statements in the body whose opening brace is \p BodyBrace. The
+/// body is stored in the child lines of the brace, one line per statement.
+size_t countLambdaBodyStatements(const FormatToken &BodyBrace) {
+  size_t Count = 0;
+  for (const AnnotatedLine *Child : BodyBrace.Children) {
+    for (const FormatToken *Tok = Child->First; Tok; Tok = Tok->Next)
+      if (Tok->is(tok::semi))
+        ++Count;
+  }
+  return Count;
+}
+
+/// Information about the body of a lambda.
+struct LambdaBody {
+  FormatToken *Brace = nullptr;
+  FormatToken *ClosingBrace = nullptr;
+  /// Number of statements in the body.
+  size_t Statements = 0;
+};
+
+/// Collects the body of the lambda introduced by \p Introducer. Returns
+/// \c false if the body cannot be determined.
+bool getLambdaBody(FormatToken &Introducer, LambdaBody &Body) {
+  FormatToken *Tok = Introducer.MatchingParen;
+  for (; Tok && Tok->isNot(tok::l_brace); Tok = Tok->Next) {
+  }
+  if (!Tok || Tok->isNot(TT_LambdaLBrace) || !Tok->MatchingParen)
+    return false;
+  Body.Brace = Tok;
+  Body.ClosingBrace = Tok->MatchingParen;
+  Body.Statements = countLambdaBodyStatements(*Tok);
+  return true;
+}
+
+/// Returns \c true if \p Tok belongs to a lambda body that has to stay on a
+/// single line, including its closing brace.
+bool isInSingleLineLambdaBody(const FormatToken &Tok) {
+  if (Tok.is(tok::r_brace) && Tok.MatchingParen &&
+      Tok.MatchingParen->is(TT_LambdaLBrace) &&
+      Tok.MatchingParen->KeepLambdaBodyOnSingleLine)
+    return true;
+  const unsigned Level = Tok.NestingLevel;
+  for (const auto *Prev = Tok.getPreviousNonComment(); Prev;
+       Prev = Prev->getPreviousNonComment()) {
+    if (Prev->NestingLevel < Level)
+      return Prev->is(TT_LambdaLBrace) && Prev->KeepLambdaBodyOnSingleLine &&
+             Prev->MatchingParen != nullptr;
+    if (Prev->NestingLevel == Level)
+      break;
+  }
+  return false;
+}
+
+/// Returns \c true if \p Tok or one of its children holds a token that prevents
+/// a block from being written on a single line, i.e. a preprocessor directive
+/// or a comment.
+bool tokenOrChildrenPreventSingleLine(const FormatToken &Tok) {
+  if (Tok.is(tok::hash) || Tok.is(tok::comment))
+    return true;
+  for (const AnnotatedLine *Child : Tok.Children)
+    for (const FormatToken *T = Child->First; T; T = T->Next)
+      if (tokenOrChildrenPreventSingleLine(*T))
+        return true;
+  return false;
+}
+
+/// Returns \c true if the lambda body whose brace is \p BodyBrace contains a
+/// token that prevents the body from being put on a single line, such as a
+/// preprocessor directive or a comment. A comment directly behind the opening
+/// brace also prevents it.
+bool lambdaBodyMustStayMultiLine(const FormatToken &BodyBrace) {
+  if (tokenOrChildrenPreventSingleLine(BodyBrace))
+    return true;
+  const FormatToken *Next = BodyBrace.getNextNonComment();
+  if (BodyBrace.Next && BodyBrace.Next->is(tok::comment))
+    return true;
+  return Next && Next->is(tok::comment);
+}
+
+/// Returns \c true if no space is written in front of \p Tok when it directly
+/// follows another token.
+bool gluesToPrevious(const FormatToken &Tok) {
+  return Tok.isOneOf(tok::r_paren, tok::r_square, tok::r_brace, tok::comma,
+                     tok::semi, tok::period, tok::arrow, tok::coloncolon,
+                     tok::l_paren, tok::l_square);
+}
+
+/// Returns a conservative estimate of the rendered length of the token chain
+/// from \p First up to but excluding \p Last, including the spaces that the
+/// formatter inserts between tokens and the tokens of nested lines. The spaces
+/// are not known yet at this point, so they are over-estimated on purpose.
+unsigned getRenderedLength(const FormatToken &First, const FormatToken *Last) {
+  unsigned Length = 0;
+  for (const FormatToken *Tok = &First; Tok && Tok != Last; Tok = Tok->Next) {
+    Length += Tok->TokenText.size();
+    if (Tok->Next && Tok->Next != Last && !gluesToPrevious(*Tok->Next))
+      Length += 1;
+    for (const AnnotatedLine *Child : Tok->Children)
+      for (const FormatToken *T = Child->First; T; T = T->Next)
+        Length += getRenderedLength(*T, nullptr);
+  }
+  return Length;
+}
+
+/// Returns the rendered length of the lambda introduced by \p Introducer,
+/// including its body and the closing brace.
+unsigned getLambdaSourceLength(const FormatToken &Introducer,
+                               const FormatToken &ClosingBrace) {
+  return getRenderedLength(Introducer, ClosingBrace.Next);
+}
+
+/// Applies the custom lambda rules to \p Line by marking the tokens of the
+/// affected lambda bodies.
+void annotateLambdaRules(AnnotatedLine &Line, const FormatStyle &Style) {
+  for (FormatToken *Introducer = Line.First; Introducer;
+       Introducer = Introducer->Next) {
+    if (Introducer->isNot(TT_LambdaLSquare))
+      continue;
+    LambdaBody Body;
+    if (!getLambdaBody(*Introducer, Body))
+      continue;
+
+    const bool Assigned = isAssignedLambda(*Introducer);
+    const bool Invoked = isImmediatelyInvokedLambda(*Introducer);
+    const bool Argument = isLambdaCallArgument(*Introducer);
+
+    // Makes the signature of the lambda, i.e. everything up to the body brace,
+    // unbreakable so that it stays on the line of the assignment it belongs to.
+    auto KeepSignatureTogether = [&] {
+      for (FormatToken *Tok = Introducer; Tok && Tok != Body.Brace;
+           Tok = Tok->Next) {
+        if (Tok->isNot(tok::comment)) {
+          Tok->CanBreakBefore = false;
+          Tok->KeepWithPreviousToken = true;
+        }
+        Tok->MustBreakBefore = false;
+      }
+      Body.Brace->MustBreakBefore = false;
+    };
+
+    // Rule 1: at most one statement keeps the whole lambda on a single line.
+    // A body that holds a preprocessor directive or a comment cannot be put on
+    // a single line, and neither can one that does not fit.
+    if (Body.Statements <= 1 && !lambdaBodyMustStayMultiLine(*Body.Brace) &&
+        (Style.ColumnLimit == 0 ||
+         getLambdaSourceLength(*Introducer, *Body.ClosingBrace) +
+                 Line.Level * Style.IndentWidth <=
+             Style.ColumnLimit)) {
+      Body.Brace->KeepLambdaBodyOnSingleLine = true;
+      KeepSignatureTogether();
+      Body.ClosingBrace->MustBreakBefore = false;
+      continue;
+    }
+
+    // The body only stays inline if the whole statement fits the column limit.
+    const bool Fits = [&] {
+      if (Style.ColumnLimit == 0)
+        return true;
+      unsigned Prefix = getRenderedLength(*Line.First, Introducer);
+      const unsigned Lambda =
+          getLambdaSourceLength(*Introducer, *Body.ClosingBrace);
+      unsigned Suffix = 0;
+      for (const FormatToken *Tok = Body.ClosingBrace->Next;
+           Tok && Tok->isNot(tok::semi); Tok = Tok->Next)
+        Suffix += getRenderedLength(*Tok, Tok->Next);
+      return Prefix + Lambda + Suffix + Line.Level * Style.IndentWidth <=
+             Style.ColumnLimit;
+    }();
+
+    // A lambda is kept inline when it is an argument that fits the column limit
+    // and whose body can be written on a single line. An assigned or invoked
+    // lambda is always broken, and so is an argument that does not fit.
+    const bool BodyCanBeInline = !lambdaBodyMustStayMultiLine(*Body.Brace);
+    const bool KeepInline = Argument && Fits && BodyCanBeInline;
+    if (KeepInline || (!Assigned && !Invoked && !Argument && BodyCanBeInline)) {
+      Body.Brace->PreferLambdaBodyOnSingleLine = true;
+      KeepSignatureTogether();
+      Body.ClosingBrace->MustBreakBefore = false;
+      continue;
+    }
+
+    // Rule 3: the lambda is broken. The signature stays with the assignment and
+    // the braces go onto their own lines, aligned with the current scope.
+    KeepSignatureTogether();
+    Body.Brace->BreakLambdaBodyBefore = true;
+    Body.ClosingBrace->BreakLambdaBodyAfter = true;
+    const unsigned Indent = Line.Level * Style.IndentWidth;
+    Body.Brace->LambdaBodyIndentOverride = Indent;
+    Body.Brace->HasLambdaBodyIndentOverride = true;
+    Body.ClosingBrace->LambdaBodyIndentOverride = Indent;
+    Body.ClosingBrace->HasLambdaBodyIndentOverride = true;
+    if (Invoked) {
+      // The invocation goes onto its own line behind the closing brace.
+      if (FormatToken *Call = Body.ClosingBrace->getNextNonComment()) {
+        if (Call->is(tok::l_paren)) {
+          Call->MustBreakBefore = true;
+          Call->LambdaBodyIndentOverride = Indent;
+          Call->HasLambdaBodyIndentOverride = true;
+        }
+      }
+    }
+  }
+}
+
+} // namespace
+
 void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
   if (Line.Computed)
     return;
@@ -4288,6 +4566,10 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
       Current->ForcedPointerOrReferenceAlignment = FormatStyle::PAS_Left;
   }
 
+  // Custom rules for lambdas: decide which bodies stay on a single line and
+  // which ones have to be broken.
+  annotateLambdaRules(Line, Style);
+
   bool InFunctionDecl = Line.MightBeFunctionDecl;
   bool InParameterList = false;
   for (auto *Current = First->Next; Current; Current = Current->Next) {
@@ -4335,7 +4617,16 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
 
 
     const auto &Children = Prev->Children;
-    if (!Children.empty() && Children.back()->Last->is(TT_LineComment)) {
+    if (Current->KeepWithPreviousToken) {
+      // Custom rule: keep the lambda signature on its assignment line.
+      Current->MustBreakBefore = false;
+      Current->CanBreakBefore = false;
+    } else if (isInSingleLineLambdaBody(*Current)) {
+      // Custom rule 1: a lambda body that holds at most one statement stays on
+      // a single line, so nothing inside it may break.
+      Current->MustBreakBefore = false;
+      Current->CanBreakBefore = false;
+    } else if (!Children.empty() && Children.back()->Last->is(TT_LineComment)) {
       Current->MustBreakBefore = true;
     } else {
       Current->MustBreakBefore =
@@ -4346,9 +4637,10 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
       }
     }
 
-    Current->CanBreakBefore =
-        !Line.IsModuleOrImportDecl &&
-        (Current->MustBreakBefore || canBreakBefore(Line, *Current));
+    if (!isInSingleLineLambdaBody(*Current) && !Current->KeepWithPreviousToken)
+      Current->CanBreakBefore =
+          !Line.IsModuleOrImportDecl &&
+          (Current->MustBreakBefore || canBreakBefore(Line, *Current));
 
     if (Current->is(TT_FunctionDeclarationLParen)) {
       InParameterList = true;
@@ -5873,6 +6165,20 @@ static bool isAllmanLambdaBrace(const FormatToken &Tok) {
 
 bool TokenAnnotator::mustBreakBefore(AnnotatedLine &Line,
                                      const FormatToken &Right) const {
+  // Custom rules for lambdas. They take precedence over
+  // AllowShortLambdasOnASingleLine:
+  //  - a body that has to stay on a single line never breaks, whatever the
+  //    style or the column limit says;
+  //  - a body that has to be broken always breaks before its opening brace;
+  //  - an argument body is preferred on a single line, so it only breaks when
+  //    the column limit forces it.
+  if (Right.is(TT_LambdaLBrace) && Right.KeepLambdaBodyOnSingleLine)
+    return false;
+  if (Right.is(TT_LambdaLBrace) && Right.PreferLambdaBodyOnSingleLine)
+    return false;
+  if (Right.is(TT_LambdaLBrace) && Right.BreakLambdaBodyBefore)
+    return true;
+
   if (Right.NewlinesBefore > 1 && Style.MaxEmptyLinesToKeep > 0 &&
       (!Style.RemoveEmptyLinesInUnwrappedLines || &Right == Line.First)) {
     return true;
@@ -7044,6 +7350,37 @@ bool isTypeToken(const FormatToken &Tok, const LangOptions &LangOpts) {
 /// Returns \c true if \p PointerOrReference completes an abstract type, i.e. if
 /// the '*'/'&' is not attached to a name. This is the case for isolated types
 /// such as the `void (*)(const char *)` in `using T = void (*)(const char *);`.
+/// Returns \c true if \p Tok terminates the declarator of a variable, a
+/// parameter or a function, i.e. if a name in front of it is the name of a
+/// declared entity rather than a type.
+bool endsDeclarator(const FormatToken &Tok) {
+  return Tok.isOneOf(tok::equal, tok::semi, tok::comma, tok::r_paren,
+                     tok::r_square, tok::r_brace, tok::l_square, tok::l_brace,
+                     tok::colon, tok::question, tok::ellipsis, tok::kw_noexcept,
+                     TT_RequiresClause, TT_CtorInitializerColon);
+}
+
+/// Returns \c true if \p Tok can be a type in an abstract declarator, as
+/// opposed to the name of a declared variable or parameter. A plain identifier
+/// such as `argv` is a name, whereas `T` is the usual spelling of a template
+/// parameter and a `TT_TypeName` is known to name a type.
+bool looksLikeTypeName(const FormatToken &Tok, const LangOptions &LangOpts) {
+  if (Tok.is(TT_TypeName) || Tok.isTypeName(LangOpts))
+    return true;
+  if (Tok.is(tok::kw_auto))
+    return true;
+  if (Tok.isNot(tok::identifier))
+    return false;
+  StringRef Name = Tok.TokenText;
+  if (Name.size() == 1 && Name[0] >= 'A' && Name[0] <= 'Z')
+    return true;
+  return Name.contains('_') || Name.contains("::");
+}
+
+/// Returns \c true if \p PointerOrReference completes an abstract type. A
+/// '*'/'&' is only part of an abstract type when no name is declared by it, so
+/// its left attachment must not be forced for declarations such as `char **argv`
+/// or `char **argv_real = ...`.
 bool isIsolatedTypePointerOrReference(const AnnotatedLine &Line,
                                       const FormatToken &PointerOrReference,
                                       const LangOptions &LangOpts) {
@@ -7051,51 +7388,38 @@ bool isIsolatedTypePointerOrReference(const AnnotatedLine &Line,
   if (!Next)
     return false;
 
-  // `char *const` is an abstract type even though it is followed by a name.
+  // `char *const` is an abstract type even though a name may follow it.
   if (Next->canBePointerOrReferenceQualifier())
     Next = Next->getNextNonComment();
   if (!Next)
     return false;
 
+  // Anything that is not an identifier cannot be the name of a declarator, so
+  // the '*'/'&' is part of an abstract type.
   if (!Next->Tok.isAnyIdentifier())
     return true;
 
-  // An identifier behind the '*'/'&' may either be the name of a declarator, as
-  // in `char *name`, or a type, as in `const T *` or as in
-  // `void (*)(const char *p)`. The name of a declarator is followed by the end
-  // of the declaration, by another declarator, or by an initializer:
+  // An identifier behind the '*'/'&' is the name of a declared entity, as in
+  // `char *name` or `char **argv`, unless it is a type as in `const T *` or as
+  // in `void (*)(const char *p)`. A declared name is followed by the end of its
+  // declarator, by an initializer or by another declarator, so only an
+  // identifier that is followed by something that cannot follow a name can be a
+  // type.
   const auto *AfterName = Next->getNextNonComment();
   if (!AfterName)
+    return looksLikeTypeName(*Next, LangOpts);
+  // `T *` and `T &`: the type is only followed by more of its own declarator.
+  if (AfterName->isOneOf(tok::star, tok::amp, tok::ampamp))
+    return true;
+  if (AfterName->is(TT_TemplateCloser))
+    return looksLikeTypeName(*Next, LangOpts);
+  // `const char *`: the '*'/'&' ends an abstract type.
+  if (endsDeclarator(*AfterName))
     return false;
-  if (AfterName->isPointerOrReference() ||
-      AfterName->isOneOf(tok::semi, tok::comma, tok::r_paren, tok::r_square,
-                         tok::l_brace, tok::equal))
-    return false;
-  return isTypeToken(*AfterName, LangOpts) &&
-         AfterName->isNot(TT_FunctionTypeLParen);
-}
-
-/// Returns \c true if \p PointerOrReference is part of the parameter list of the
-/// function declared by \p Line, as in `int f(char *arg)`. Such a '*'/'&' is
-/// part of a declarator or of an abstract parameter type and is left to the
-/// pointer and reference alignment of the style.
-bool isInFunctionParameterList(const AnnotatedLine &Line,
-                               const FormatToken &PointerOrReference) {
-  const FormatToken *ParamList = nullptr;
-  if (findFunctionDeclName(Line, ParamList) == nullptr || !ParamList)
-    return false;
-
-  // The parameter list is nested more deeply than the function name.
-  if (PointerOrReference.NestingLevel <= ParamList->NestingLevel)
-    return false;
-
-  // The token has to appear behind the parenthesis that opens the list.
-  for (const auto *Tok = ParamList; Tok; Tok = Tok->Next) {
-    if (Tok == &PointerOrReference)
-      return true;
-    if (Tok->NestingLevel < ParamList->NestingLevel)
-      return false;
-  }
+  // `void (*)(const char *p)`: the identifier is a type when a type follows it.
+  if (isTypeToken(*AfterName, LangOpts))
+    return looksLikeTypeName(*Next, LangOpts) ||
+           AfterName->isNot(tok::identifier);
   return false;
 }
 

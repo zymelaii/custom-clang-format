@@ -1481,6 +1481,11 @@ ContinuationIndenter::getNewLineColumn(const LineState &State) {
   FormatToken &Current = *State.NextToken;
   const auto &CurrentState = State.Stack.back();
 
+  // Custom rule: a lambda body brace that has to be broken is aligned with the
+  // first token of the current scope, independently of the style.
+  if (Current.HasLambdaBodyIndentOverride)
+    return Current.LambdaBodyIndentOverride;
+
   if (CurrentState.IsCSharpGenericTypeConstraint &&
       Current.isNot(TT_CSharpGenericTypeConstraint)) {
     return CurrentState.ColonPos + 2;

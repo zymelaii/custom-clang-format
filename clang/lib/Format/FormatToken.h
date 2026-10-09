@@ -639,6 +639,31 @@ public:
   std::optional<FormatStyle::PointerAlignmentStyle>
       ForcedPointerOrReferenceAlignment;
 
+  /// Custom rule: this token opens a lambda body that has to be kept on a
+  /// single line, whatever the style says.
+  bool KeepLambdaBodyOnSingleLine = false;
+
+  /// Custom rule: this token must not be moved away from the token in front of
+  /// it. Used to keep a lambda signature on the line of its assignment.
+  bool KeepWithPreviousToken = false;
+
+  /// Custom rule: this token opens a lambda body that has to be kept on a
+  /// single line as long as it fits the column limit.
+  bool PreferLambdaBodyOnSingleLine = false;
+
+  /// Custom rule: this '{' opens a lambda body that has to be broken and
+  /// aligned with the first token of the current scope.
+  bool BreakLambdaBodyBefore = false;
+
+  /// Custom rule: this '}' closes a lambda body that has to be broken and
+  /// aligned with the first token of the current scope.
+  bool BreakLambdaBodyAfter = false;
+
+  /// Custom rule: when set, this lambda body brace is indented to this column
+  /// instead of the column the style would compute.
+  unsigned LambdaBodyIndentOverride = 0;
+  bool HasLambdaBodyIndentOverride = false;
+
   /// If this token starts a block, this contains all the unwrapped lines
   /// in it.
   SmallVector<AnnotatedLine *, 1> Children;
