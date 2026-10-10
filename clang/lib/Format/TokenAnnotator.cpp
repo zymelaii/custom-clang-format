@@ -4460,6 +4460,11 @@ void annotateLambdaRules(AnnotatedLine &Line, const FormatStyle &Style) {
 
 namespace {
 
+// Defined with the custom pointer rules further down in this file.
+const FormatToken *findFunctionDeclName(const AnnotatedLine &Line,
+                                        const FormatToken *&ParamList);
+bool isTypeToken(const FormatToken &Tok, const LangOptions &LangOpts);
+
 /// The number of characters above which a member access expression is broken.
 constexpr unsigned ChainBreakLengthLimit = 48;
 
@@ -4618,6 +4623,121 @@ void annotateChainBreaks(AnnotatedLine &Line) {
   if (!Line.First)
     return;
   annotateChainLevel(Line.First, nullptr);
+}
+
+/// Returns \c true if the parenthesis \p LParen opens a list of parameter
+/// declarations rather than the arguments of a call. `StringRef Name("text")`
+/// for example initializes a variable and is not a declaration.
+bool looksLikeParameterList(const FormatToken &LParen) {
+  const FormatToken *First = LParen.getNextNonComment();
+  if (!First || First == LParen.MatchingParen)
+    return true;
+  // The arguments of a call start with an expression. A literal, a brace or a
+  // bracket never starts a parameter declaration.
+  return First->isNoneOf(tok::string_literal, tok::numeric_constant,
+                         tok::char_constant, tok::l_brace, tok::l_square,
+                         tok::kw_true, tok::kw_false, tok::kw_nullptr);
+}
+
+/// Returns \c true if the name \p Name of a function is preceded by a type, as
+/// in `BOOL f()`, `T *f()` or `X *Y::f()`. A call, as in `obj->f()`, is not.
+bool isFunctionNamePrecededByType(const FormatToken &Name,
+                                  const LangOptions &LangOpts) {
+  const FormatToken *Before = Name.getPreviousNonComment();
+  while (Before && (Before->isPointerOrReference() ||
+                    Before->canBePointerOrReferenceQualifier()))
+    Before = Before->getPreviousNonComment();
+  return Before && isTypeToken(*Before, LangOpts);
+}
+
+/// Returns \c true if \p Line declares or defines a function. \p End is set to
+/// the last token of the declaration head, i.e. of the return type, the name and
+/// the parameter list, including a trailing return type or trailing qualifiers.
+bool findFunctionDeclarationHead(const AnnotatedLine &Line,
+                                 const LangOptions &LangOpts,
+                                 const FormatToken *&End) {
+  const FormatToken *ParamList = nullptr;
+  const FormatToken *Name = findFunctionDeclName(Line, ParamList);
+  if (!Name || !ParamList || !ParamList->MatchingParen ||
+      !Line.MightBeFunctionDecl ||
+      !isFunctionNamePrecededByType(*Name, LangOpts) ||
+      !looksLikeParameterList(*ParamList)) {
+    // A function pointer declared as `BOOL (*f)(int)` or `BOOL (C::*f)(int)`,
+    // and an overloaded operator, as in `void *operator&(int)`. A call never
+    // has a type in front of the parenthesis that holds the declarator.
+    ParamList = nullptr;
+    for (const FormatToken *Tok = Line.getFirstNonComment(); Tok;
+         Tok = Tok->Next) {
+      if (Tok->isNot(tok::l_paren) || !Tok->MatchingParen)
+        continue;
+      const FormatToken *Before = Tok->getPreviousNonComment();
+      if (Before && Before->isNot(tok::identifier)) {
+        // An overloaded operator name, as in `operator&(`.
+        bool Operator = false;
+        for (const FormatToken *T = Line.getFirstNonComment(); T && T != Tok;
+             T = T->Next)
+          if (T->is(tok::kw_operator) &&
+              T->NestingLevel == Tok->NestingLevel) {
+            Operator = true;
+            break;
+          }
+        if (!Operator)
+          continue;
+        ParamList = Tok;
+        break;
+      }
+      if (!Before || !isTypeToken(*Before, LangOpts))
+        continue;
+      const FormatToken *Star = nullptr;
+      for (const FormatToken *T = Tok->getNextNonComment();
+           T && T != Tok->MatchingParen; T = T->getNextNonComment())
+        if (T->isPointerOrReference()) {
+          Star = T;
+          break;
+        }
+      if (!Star || !Star->getNextNonComment() ||
+          Star->getNextNonComment()->isNot(tok::identifier))
+        continue;
+      const FormatToken *Params = Tok->MatchingParen->getNextNonComment();
+      if (Params && Params->is(tok::l_paren) && Params->MatchingParen &&
+          looksLikeParameterList(*Params)) {
+        ParamList = Params;
+        break;
+      }
+    }
+    if (!ParamList || !looksLikeParameterList(*ParamList))
+      return false;
+  }
+  End = ParamList->MatchingParen;
+  // Trailing qualifiers, as in `void f() const noexcept`, a trailing return
+  // type, as in `auto f() -> const T *`, and the initializer of a function
+  // pointer, as in `BOOL (*f)(int) = nullptr`, belong to the declaration head.
+  for (const FormatToken *Tok = End->Next; Tok && Tok->Next; Tok = Tok->Next) {
+    if (Tok->NestingLevel < ParamList->NestingLevel)
+      break;
+    if (Tok->NestingLevel == ParamList->NestingLevel &&
+        Tok->isOneOf(tok::semi, tok::l_brace, tok::colon, tok::comma))
+      break;
+    End = Tok;
+  }
+  return true;
+}
+
+/// Applies the custom rule for the head of a function declaration: the return
+/// type, the name and the parameter list are never broken, whatever the column
+/// limit says.
+void annotateFunctionHead(AnnotatedLine &Line, const LangOptions &LangOpts) {
+  if (!Line.First)
+    return;
+  const FormatToken *End = nullptr;
+  if (!findFunctionDeclarationHead(Line, LangOpts, End))
+    return;
+  for (FormatToken *Tok = Line.First->Next; Tok && Tok != End->Next;
+       Tok = Tok->Next) {
+    if (Tok->is(tok::comment))
+      continue;
+    Tok->KeepWithPreviousToken = true;
+  }
 }
 
 } // namespace
@@ -4796,6 +4916,9 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
   // Custom rule for chains of calls: a long chain is broken into one line per
   // call.
   annotateChainBreaks(Line);
+
+  // Custom rule for the head of a function declaration: it is never broken.
+  annotateFunctionHead(Line, LangOpts);
 
   bool InFunctionDecl = Line.MightBeFunctionDecl;
   bool InParameterList = false;
