@@ -4269,7 +4269,13 @@ bool isInSingleLineLambdaBody(const FormatToken &Tok) {
 /// a block from being written on a single line, i.e. a preprocessor directive
 /// or a comment.
 bool tokenOrChildrenPreventSingleLine(const FormatToken &Tok) {
-  if (Tok.is(tok::hash) || Tok.is(tok::comment))
+  // A preprocessor directive always occupies a line of its own.
+  if (Tok.is(tok::hash))
+    return true;
+  // A line comment reaches to the end of the line, so no token may follow it.
+  // A block comment only prevents a single line when it spans several lines.
+  if (Tok.is(tok::comment) &&
+      (isLineComment(Tok) || Tok.TokenText.contains('\n')))
     return true;
   for (const AnnotatedLine *Child : Tok.Children)
     for (const FormatToken *T = Child->First; T; T = T->Next)
@@ -4285,10 +4291,22 @@ bool tokenOrChildrenPreventSingleLine(const FormatToken &Tok) {
 bool lambdaBodyMustStayMultiLine(const FormatToken &BodyBrace) {
   if (tokenOrChildrenPreventSingleLine(BodyBrace))
     return true;
-  const FormatToken *Next = BodyBrace.getNextNonComment();
-  if (BodyBrace.Next && BodyBrace.Next->is(tok::comment))
-    return true;
-  return Next && Next->is(tok::comment);
+  // A line comment that directly follows the opening brace would swallow the
+  // statements behind it.
+  return BodyBrace.Next && isLineComment(*BodyBrace.Next);
+}
+
+/// Returns \c true if a line comment is written between the introducer of a
+/// lambda and its body brace, as in `[]() // comment`. Such a comment reaches to
+/// the end of the line, so the brace may not follow it on the same line.
+bool lambdaSignatureHasLineComment(const FormatToken &Introducer,
+                                   const FormatToken &BodyBrace) {
+  for (const FormatToken *Tok = Introducer.Next;
+       Tok && Tok != &BodyBrace; Tok = Tok->Next) {
+    if (isLineComment(*Tok))
+      return true;
+  }
+  return false;
 }
 
 /// Returns \c true if no space is written in front of \p Tok when it directly
@@ -4352,17 +4370,22 @@ void annotateLambdaRules(AnnotatedLine &Line, const FormatStyle &Style) {
       Body.Brace->MustBreakBefore = false;
     };
 
-    // Rule 1: at most one statement keeps the whole lambda on a single line.
-    // A body that holds a preprocessor directive or a comment cannot be put on
-    // a single line, and neither can one that does not fit.
-    if (Body.Statements <= 1 && !lambdaBodyMustStayMultiLine(*Body.Brace) &&
-        (Style.ColumnLimit == 0 ||
-         getLambdaSourceLength(*Introducer, *Body.ClosingBrace) +
-                 Line.Level * Style.IndentWidth <=
-             Style.ColumnLimit)) {
+    // A body that holds a comment or a preprocessor directive cannot be written
+    // on a single line. Neither can a lambda whose signature ends in a line
+    // comment, because that comment would swallow the opening brace.
+    const bool BodyCanBeInline =
+        !lambdaBodyMustStayMultiLine(*Body.Brace) &&
+        !lambdaSignatureHasLineComment(*Introducer, *Body.Brace);
+
+    // Rule 1: at most one statement keeps the whole lambda on a single line,
+    // ignoring every other condition.
+    if (Body.Statements <= 1 && BodyCanBeInline) {
       Body.Brace->KeepLambdaBodyOnSingleLine = true;
       KeepSignatureTogether();
+      Body.Brace->MustBreakBefore = false;
+      Body.Brace->CanBreakBefore = false;
       Body.ClosingBrace->MustBreakBefore = false;
+      Body.ClosingBrace->CanBreakBefore = false;
       continue;
     }
 
@@ -4384,9 +4407,21 @@ void annotateLambdaRules(AnnotatedLine &Line, const FormatStyle &Style) {
     // A lambda is kept inline when it is an argument that fits the column limit
     // and whose body can be written on a single line. An assigned or invoked
     // lambda is always broken, and so is an argument that does not fit.
-    const bool BodyCanBeInline = !lambdaBodyMustStayMultiLine(*Body.Brace);
     const bool KeepInline = Argument && Fits && BodyCanBeInline;
-    if (KeepInline || (!Assigned && !Invoked && !Argument && BodyCanBeInline)) {
+    if (KeepInline) {
+      // Rule 4: the lambda fits, so it is not allowed to break at all and is
+      // embedded in the function call on a single line.
+      Body.Brace->KeepLambdaBodyOnSingleLine = true;
+      KeepSignatureTogether();
+      Body.Brace->MustBreakBefore = false;
+      Body.Brace->CanBreakBefore = false;
+      Body.ClosingBrace->MustBreakBefore = false;
+      Body.ClosingBrace->CanBreakBefore = false;
+      continue;
+    }
+    if (!Assigned && !Invoked && !Argument && BodyCanBeInline) {
+      // No rule covers this lambda, so it is only preferred on a single line
+      // and the column limit may still break it.
       Body.Brace->PreferLambdaBodyOnSingleLine = true;
       KeepSignatureTogether();
       Body.ClosingBrace->MustBreakBefore = false;
@@ -6202,6 +6237,13 @@ bool TokenAnnotator::mustBreakBefore(AnnotatedLine &Line,
   if (Right.is(TT_LambdaLBrace) && Right.PreferLambdaBodyOnSingleLine)
     return false;
   if (Right.is(TT_LambdaLBrace) && Right.BreakLambdaBodyBefore)
+    return true;
+  // A lambda body that has to be broken puts its opening brace, its statements
+  // and its closing brace each on their own line.
+  if (Right.BreakLambdaBodyAfter)
+    return true;
+  if (Right.Previous && Right.Previous->is(TT_LambdaLBrace) &&
+      Right.Previous->BreakLambdaBodyBefore)
     return true;
 
   if (Right.NewlinesBefore > 1 && Style.MaxEmptyLinesToKeep > 0 &&

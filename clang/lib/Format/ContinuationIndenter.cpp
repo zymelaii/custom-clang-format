@@ -475,6 +475,12 @@ bool ContinuationIndenter::mustBreak(const LineState &State) {
   const FormatToken &Current = *State.NextToken;
   const FormatToken &Previous = *Current.Previous;
   const auto &CurrentState = State.Stack.back();
+  // Custom rule 1: a lambda body that holds at most one statement is forced
+  // onto a single line, so its opening brace never breaks. This has to be
+  // checked before the brace wrapping of the style, which would otherwise move
+  // the brace onto its own line.
+  if (Current.is(TT_LambdaLBrace) && Current.KeepLambdaBodyOnSingleLine)
+    return false;
   if (Style.BraceWrapping.AfterRequiresExpression && Current.CanBreakBefore &&
       Current.is(TT_RequiresExpressionLBrace) &&
       getLengthToMatchingParen(Current, State.Stack) > getColumnLimit(State)) {

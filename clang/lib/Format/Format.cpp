@@ -2772,8 +2772,64 @@ private:
   }
 };
 
-class BracesInserter : public TokenAnalyzer {
+// Custom rule: a line comment written behind the opening brace of a lambda is
+// moved in front of the brace, so that the brace stands alone on its line.
+//
+//   const auto t = [] { // comment      const auto t = [] // comment
+//     return 0;                    ->   {
+//   };                                    return 0;
+//                                       };
+class LambdaBraceCommentMover : public TokenAnalyzer {
 public:
+  LambdaBraceCommentMover(const Environment &Env, const FormatStyle &Style)
+      : TokenAnalyzer(Env, Style) {}
+
+  std::pair<tooling::Replacements, unsigned>
+  analyze(TokenAnnotator &Annotator,
+          SmallVectorImpl<AnnotatedLine *> &AnnotatedLines,
+          FormatTokenLexer &Tokens) override {
+    AffectedRangeMgr.computeAffectedLines(AnnotatedLines);
+    if (!Style.isCpp())
+      return {tooling::Replacements(), 0};
+    tooling::Replacements Result;
+    moveBraceComments(AnnotatedLines, Result);
+    return {Result, 0};
+  }
+
+private:
+  void moveBraceComments(SmallVectorImpl<AnnotatedLine *> &Lines,
+                         tooling::Replacements &Result) {
+    const auto &SourceMgr = Env.getSourceManager();
+    for (AnnotatedLine *Line : Lines) {
+      if (!Line->Children.empty())
+        moveBraceComments(Line->Children, Result);
+      if (!Line->Affected)
+        continue;
+      for (const FormatToken *Token = Line->First; Token; Token = Token->Next) {
+        if (Token->isNot(TT_LambdaLBrace))
+          continue;
+        const FormatToken *Comment = Token->Next;
+        // Only a line comment that directly follows the brace on the same line
+        // has to move; a block comment may stay where it is.
+        if (!Comment || !isLineComment(*Comment) || Comment->NewlinesBefore != 0)
+          continue;
+        const FormatToken *Prev = Token->getPreviousNonComment();
+        if (!Prev)
+          continue;
+        const auto Range = CharSourceRange::getCharRange(Token->Tok.getEndLoc(),
+                                                         Comment->Tok.getEndLoc());
+        cantFail(Result.add(tooling::Replacement(SourceMgr, Range, "")));
+        // The comment moves behind the signature and the brace starts on a new
+        // line, so that the comment cannot swallow it.
+        cantFail(Result.add(tooling::Replacement(
+            SourceMgr, Prev->Tok.getEndLoc(), 0,
+            (" " + Comment->TokenText + "\n").str())));
+      }
+    }
+  }
+};
+
+class BracesInserter : public TokenAnalyzer {public:
   BracesInserter(const Environment &Env, const FormatStyle &Style)
       : TokenAnalyzer(Env, Style) {}
 
@@ -4512,6 +4568,16 @@ reformat(const FormatStyle &Style, StringRef Code,
       Style.JavaScriptQuotes != FormatStyle::JSQS_Leave) {
     Passes.emplace_back([&](const Environment &Env) {
       return JavaScriptRequoter(Env, Expanded).process(/*SkipAnnotation=*/true);
+    });
+  }
+
+  if (Style.isCpp()) {
+    // Custom rule: move a line comment that stands behind the opening brace of a
+    // lambda in front of it. This runs before the main formatter, so that the
+    // formatter sees a brace without a trailing comment and puts it on a line of
+    // its own.
+    Passes.emplace_back([&](const Environment &Env) {
+      return LambdaBraceCommentMover(Env, Expanded).process();
     });
   }
 
