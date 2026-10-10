@@ -4325,7 +4325,9 @@ unsigned getRenderedLength(const FormatToken &First, const FormatToken *Last) {
   unsigned Length = 0;
   for (const FormatToken *Tok = &First; Tok && Tok != Last; Tok = Tok->Next) {
     Length += Tok->TokenText.size();
-    if (Tok->Next && Tok->Next != Last && !gluesToPrevious(*Tok->Next))
+    // A member name follows its `.`/`->` without a space.
+    if (Tok->Next && Tok->Next != Last && !gluesToPrevious(*Tok->Next) &&
+        !Tok->isMemberAccess())
       Length += 1;
     for (const AnnotatedLine *Child : Tok->Children)
       for (const FormatToken *T = Child->First; T; T = T->Next)
@@ -4432,7 +4434,9 @@ void annotateLambdaRules(AnnotatedLine &Line, const FormatStyle &Style) {
     // the braces go onto their own lines, aligned with the current scope.
     KeepSignatureTogether();
     Body.Brace->BreakLambdaBodyBefore = true;
+    Body.Brace->ForcedBreakByCustomRule = true;
     Body.ClosingBrace->BreakLambdaBodyAfter = true;
+    Body.ClosingBrace->ForcedBreakByCustomRule = true;
     const unsigned Indent = Line.Level * Style.IndentWidth;
     Body.Brace->LambdaBodyIndentOverride = Indent;
     Body.Brace->HasLambdaBodyIndentOverride = true;
@@ -4443,12 +4447,177 @@ void annotateLambdaRules(AnnotatedLine &Line, const FormatStyle &Style) {
       if (FormatToken *Call = Body.ClosingBrace->getNextNonComment()) {
         if (Call->is(tok::l_paren)) {
           Call->MustBreakBefore = true;
+          Call->ForcedBreakByCustomRule = true;
           Call->LambdaBodyIndentOverride = Indent;
           Call->HasLambdaBodyIndentOverride = true;
         }
       }
     }
   }
+}
+
+} // namespace
+
+namespace {
+
+/// The number of characters above which a member access expression is broken.
+constexpr unsigned ChainBreakLengthLimit = 48;
+
+/// The number of calls a chain needs to be broken.
+constexpr size_t ChainBreakCallLimit = 3;
+
+/// A member access of a member access expression.
+struct ChainLink {
+  /// The `.` or `->` of the member access.
+  const FormatToken *Dot;
+  /// The token that follows this member access.
+  const FormatToken *End;
+  /// Whether the member names a call, as in `.f()`, rather than a member
+  /// variable, as in `.var`.
+  bool IsCall;
+  /// Whether this member access directly continues the previous one, i.e.
+  /// whether both belong to the same member access expression.
+  bool Contiguous;
+};
+
+/// Returns the first token of the postfix expression that \p Dot belongs to,
+/// i.e. the base of the chain, as in the `a` of `a.f().g()`.
+const FormatToken *findChainBaseStart(const FormatToken &Dot) {
+  const FormatToken *Tok = Dot.getPreviousNonComment();
+  for (;;) {
+    if (!Tok)
+      return nullptr;
+    // `f(x).g()`: the base continues in front of the call's parentheses.
+    if (Tok->isOneOf(tok::r_paren, tok::r_square, TT_TemplateCloser) &&
+        Tok->MatchingParen) {
+      Tok = Tok->MatchingParen->getPreviousNonComment();
+      continue;
+    }
+    // A qualified name, as in `fs::path(x).y()`.
+    if (Tok->isOneOf(tok::identifier, tok::kw_this)) {
+      const FormatToken *Before = Tok->getPreviousNonComment();
+      if (Before && Before->is(tok::coloncolon)) {
+        Tok = Before->getPreviousNonComment();
+        continue;
+      }
+      break;
+    }
+    break;
+  }
+  return Tok;
+}
+
+/// Collects the member accesses of the level [\p First, \p End). Arguments are
+/// not part of this level; they are searched for member accesses of their own.
+void collectChainLinks(const FormatToken *First, const FormatToken *End,
+                       SmallVectorImpl<ChainLink> &Links);
+
+/// Breaks the member access expressions of the level [\p First, \p End) into one
+/// line per call.
+void annotateChainLevel(const FormatToken *First, const FormatToken *End) {
+  SmallVector<ChainLink, 8> Links;
+  collectChainLinks(First, End, Links);
+  size_t I = 0;
+  while (I < Links.size()) {
+    // A member access expression is a run of directly connected member
+    // accesses, whether they name a call or a member variable.
+    size_t RunEnd = I;
+    while (RunEnd + 1 < Links.size() && Links[RunEnd + 1].Contiguous)
+      ++RunEnd;
+    // Only an expression that is long enough is broken; the length of the
+    // statement that contains it does not matter.
+    const FormatToken *Base = findChainBaseStart(*Links[I].Dot);
+    const bool BreakChains =
+        Base && getRenderedLength(*Base, Links[RunEnd].End) >
+                    ChainBreakLengthLimit;
+    if (BreakChains) {
+      // Every chain of at least three calls is broken into one line per call.
+      size_t K = I;
+      while (K <= RunEnd) {
+        if (!Links[K].IsCall) {
+          ++K;
+          continue;
+        }
+        size_t Last = K;
+        while (Last + 1 <= RunEnd && Links[Last + 1].IsCall &&
+               Links[Last + 1].Contiguous)
+          ++Last;
+        if (Last - K + 1 >= ChainBreakCallLimit) {
+          for (size_t M = K + 1; M <= Last; ++M) {
+            FormatToken *Dot = const_cast<FormatToken *>(Links[M].Dot);
+            Dot->MustBreakBefore = true;
+            Dot->ForcedBreakByCustomRule = true;
+          }
+          // The first call of the chain stays on the line of its base, and so
+          // does a member variable in front of or behind the chain.
+          const_cast<FormatToken *>(Links[K].Dot)->KeepWithPreviousToken = true;
+          for (size_t M = K; M > I && !Links[M - 1].IsCall &&
+                              Links[M - 1].Contiguous;
+               --M)
+            const_cast<FormatToken *>(Links[M - 1].Dot)->KeepWithPreviousToken =
+                true;
+          for (size_t M = Last + 1;
+               M <= RunEnd && !Links[M].IsCall && Links[M].Contiguous; ++M)
+            const_cast<FormatToken *>(Links[M].Dot)->KeepWithPreviousToken =
+                true;
+        }
+        K = Last + 1;
+      }
+    }
+    I = RunEnd + 1;
+  }
+}
+
+void collectChainLinks(const FormatToken *First, const FormatToken *End,
+                       SmallVectorImpl<ChainLink> &Links) {
+  // The token that follows the previous member access of this level.
+  const FormatToken *PrevLinkEnd = nullptr;
+  for (const FormatToken *Tok = First; Tok && Tok != End;) {
+    // Parentheses are transparent for this level; their content is searched for
+    // member accesses of its own.
+    if (Tok->is(tok::l_paren) && Tok->MatchingParen) {
+      annotateChainLevel(Tok->Next, Tok->MatchingParen);
+      Tok = Tok->MatchingParen->Next;
+      continue;
+    }
+    if (!Tok->isMemberAccess()) {
+      Tok = Tok->Next;
+      continue;
+    }
+    const FormatToken *Name = Tok->getNextNonComment();
+    if (!Name || Name->isNot(tok::identifier)) {
+      Tok = Tok->Next;
+      continue;
+    }
+    const FormatToken *Call = Name->getNextNonComment();
+    const bool IsCall = Call && Call->is(tok::l_paren) && Call->MatchingParen;
+    Links.push_back({Tok, nullptr, IsCall, PrevLinkEnd == Tok});
+    if (!IsCall) {
+      const FormatToken *AfterName = Call ? Call : Name->Next;
+      Links.back().End = AfterName;
+      PrevLinkEnd = AfterName;
+      Tok = AfterName;
+      continue;
+    }
+    // The result of the call may be invoked directly, as in `a.meta()()`; the
+    // whole member counts as one call.
+    annotateChainLevel(Call->Next, Call->MatchingParen);
+    const FormatToken *After = Call->MatchingParen->getNextNonComment();
+    while (After && After->is(tok::l_paren) && After->MatchingParen) {
+      annotateChainLevel(After->Next, After->MatchingParen);
+      After = After->MatchingParen->getNextNonComment();
+    }
+    Links.back().End = After;
+    PrevLinkEnd = After;
+    Tok = After;
+  }
+}
+
+/// Applies the custom chain rule to \p Line.
+void annotateChainBreaks(AnnotatedLine &Line) {
+  if (!Line.First)
+    return;
+  annotateChainLevel(Line.First, nullptr);
 }
 
 } // namespace
@@ -4623,6 +4792,10 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
   // Custom rules for lambdas: decide which bodies stay on a single line and
   // which ones have to be broken.
   annotateLambdaRules(Line, Style);
+
+  // Custom rule for chains of calls: a long chain is broken into one line per
+  // call.
+  annotateChainBreaks(Line);
 
   bool InFunctionDecl = Line.MightBeFunctionDecl;
   bool InParameterList = false;

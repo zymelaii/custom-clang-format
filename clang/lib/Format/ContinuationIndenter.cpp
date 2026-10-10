@@ -395,7 +395,11 @@ bool ContinuationIndenter::canBreak(const LineState &State) {
       State.LowestLevelOnLine < Current.NestingLevel) {
     return false;
   }
-  if (Current.isMemberAccess() && CurrentState.ContainsUnwrappedBuilder)
+  // Custom rule: a chain of calls that has to be broken must be allowed to
+  // break in front of this member access, even though the builder heuristic of
+  // the style would keep it on the same line.
+  if (Current.isMemberAccess() && CurrentState.ContainsUnwrappedBuilder &&
+      !Current.ForcedBreakByCustomRule)
     return false;
 
   // Don't create a 'hanging' indent if there are multiple blocks in a single
@@ -475,10 +479,11 @@ bool ContinuationIndenter::mustBreak(const LineState &State) {
   const FormatToken &Current = *State.NextToken;
   const FormatToken &Previous = *Current.Previous;
   const auto &CurrentState = State.Stack.back();
-  // Custom rule 1: a lambda body that holds at most one statement is forced
-  // onto a single line, so its opening brace never breaks. This has to be
-  // checked before the brace wrapping of the style, which would otherwise move
-  // the brace onto its own line.
+  // Custom rule: a token that has to stay with the previous token never starts
+  // a line. Without this the layout search would find no solution at all, as
+  // neither breaking nor not breaking would be allowed.
+  if (Current.KeepWithPreviousToken)
+    return false;
   if (Current.is(TT_LambdaLBrace) && Current.KeepLambdaBodyOnSingleLine)
     return false;
   if (Style.BraceWrapping.AfterRequiresExpression && Current.CanBreakBefore &&
@@ -1060,7 +1065,10 @@ void ContinuationIndenter::addTokenOnCurrentLine(LineState &State, bool DryRun,
     CurrentState.NoLineBreak = true;
   if (Current.isMemberAccess() && Previous.is(tok::r_paren) &&
       (Previous.MatchingParen &&
-       (Previous.TotalLength - Previous.MatchingParen->TotalLength > 10))) {
+       (Previous.TotalLength - Previous.MatchingParen->TotalLength > 10)) &&
+      // Custom rule: a chain of calls that has to be broken must be allowed to
+      // break in front of this member access.
+      !Current.ForcedBreakByCustomRule) {
     // If there is a function call with long parameters, break before trailing
     // calls. This prevents things like:
     //   EXPECT_CALL(SomeLongParameter).Times(

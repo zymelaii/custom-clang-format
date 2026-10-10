@@ -1031,6 +1031,10 @@ void UnwrappedLineParser::parseChildBlock() {
 
 void UnwrappedLineParser::parsePPDirective() {
   assert(FormatTok->is(tok::hash) && "'#' expected");
+  // Remember the level of the C++ scope the directive is written in. The level
+  // of the line itself is reset to 0 while the directive is parsed, but a
+  // `#pragma` has to be indented to its scope.
+  const unsigned ScopeLevel = Line->Level;
   ScopedMacroState MacroState(*Line, Tokens, FormatTok);
 
   nextToken();
@@ -1061,7 +1065,7 @@ void UnwrappedLineParser::parsePPDirective() {
     parsePPEndIf();
     break;
   case tok::pp_pragma:
-    parsePPPragma();
+    parsePPPragma(ScopeLevel);
     break;
   case tok::pp_error:
   case tok::pp_warning:
@@ -1250,15 +1254,19 @@ void UnwrappedLineParser::parsePPDefine() {
   addUnwrappedLine();
 }
 
-void UnwrappedLineParser::parsePPPragma() {
+void UnwrappedLineParser::parsePPPragma(unsigned ScopeLevel) {
   Line->InPragmaDirective = true;
-  parsePPUnknown();
+  parsePPUnknown(ScopeLevel);
 }
 
-void UnwrappedLineParser::parsePPUnknown() {
+void UnwrappedLineParser::parsePPUnknown(unsigned ScopeLevel) {
   while (!eof())
     nextToken();
-  if (Style.IndentPPDirectives != FormatStyle::PPDIS_None)
+  // Custom rule: a `#pragma` is always indented to the level of the C++ scope it
+  // is written in, whatever the value of `IndentPPDirectives` is.
+  if (Line->InPragmaDirective && ScopeLevel > 0)
+    Line->Level = ScopeLevel;
+  else if (Style.IndentPPDirectives != FormatStyle::PPDIS_None)
     Line->Level += PP.BranchLevel + 1;
   addUnwrappedLine();
 }

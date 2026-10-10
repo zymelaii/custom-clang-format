@@ -659,6 +659,11 @@ public:
   /// aligned with the first token of the current scope.
   bool BreakLambdaBodyAfter = false;
 
+  /// Custom rule: this token was forced onto a new line by one of the custom
+  /// rules, so the break has to be allowed even when a heuristic of the style
+  /// forbids breaking in front of it.
+  bool ForcedBreakByCustomRule = false;
+
   /// Custom rule: when set, this lambda body brace is indented to this column
   /// instead of the column the style would compute.
   unsigned LambdaBodyIndentOverride = 0;

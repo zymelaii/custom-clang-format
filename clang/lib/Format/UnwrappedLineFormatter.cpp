@@ -1779,8 +1779,9 @@ void UnwrappedLineFormatter::formatFirstToken(const AnnotatedLine &Line,
     Indent = NewlineIndent;
 
   // Preprocessor directives get indented before the hash only if specified. In
-  // Javascript import statements are indented like normal statements.
-  if (!Style.isJavaScript() &&
+  // Javascript import statements are indented like normal statements. A
+  // `#pragma` is the exception: it is always indented to its scope.
+  if (!Style.isJavaScript() && !Line.InPragmaDirective &&
       Style.IndentPPDirectives < FormatStyle::PPDIS_BeforeHash &&
       (Line.Type == LT_PreprocessorDirective ||
        Line.Type == LT_ImportStatement)) {

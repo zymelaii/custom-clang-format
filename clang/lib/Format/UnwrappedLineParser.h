@@ -141,8 +141,10 @@ private:
   void parsePPIf(bool IfDef);
   void parsePPElse();
   void parsePPEndIf();
-  void parsePPPragma();
-  void parsePPUnknown();
+  void parsePPPragma(unsigned ScopeLevel);
+  /// \p ScopeLevel is the level of the C++ scope that encloses a `#pragma`, or
+  /// 0 for a directive that is not a pragma.
+  void parsePPUnknown(unsigned ScopeLevel = 0);
   void readTokenWithJavaScriptASI();
   void parseStructuralElement(const FormatToken *OpeningBrace = nullptr,
                               IfStmtKind *IfKind = nullptr,
