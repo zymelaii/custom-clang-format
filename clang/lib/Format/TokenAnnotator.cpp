@@ -4633,8 +4633,6 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
     }
 
 
-
-
     const auto &Children = Prev->Children;
     if (Current->KeepWithPreviousToken) {
       // Custom rule: keep the lambda signature on its assignment line.
@@ -7370,32 +7368,6 @@ bool isTypeToken(const FormatToken &Tok, const LangOptions &LangOpts) {
          Tok.is(tok::coloncolon) || Tok.is(TT_TemplateCloser);
 }
 
-/// Returns \c true if \p PointerOrReference is written inside a cast, as in
-/// `reinterpret_cast<void *const*>(p)` or `(char *)p`. Such a cast is an
-/// expression rather than a type annotation and is left untouched.
-bool isInCast(const FormatToken &PointerOrReference) {
-  // A named cast, as in `reinterpret_cast<void *>(p)`, opens a template
-  // argument list with a `<` that stands in front of the token.
-  for (const FormatToken *Tok = &PointerOrReference; Tok;
-       Tok = Tok->getPreviousNonComment()) {
-    if (Tok->isOneOf(tok::semi, tok::l_brace, tok::r_brace, tok::equal))
-      break;
-    if (Tok->is(tok::less) && Tok->Previous &&
-        Tok->Previous->isOneOf(tok::kw_reinterpret_cast, tok::kw_static_cast,
-                               tok::kw_const_cast, tok::kw_dynamic_cast))
-      return true;
-  }
-  // A C style cast, as in `(char *)p`, ends with a cast parenthesis.
-  for (const FormatToken *Tok = PointerOrReference.getPreviousNonComment(); Tok;
-       Tok = Tok->getPreviousNonComment()) {
-    if (Tok->isOneOf(tok::semi, tok::l_brace, tok::r_brace, tok::equal))
-      break;
-    if (Tok->is(TT_CastRParen))
-      return true;
-  }
-  return false;
-}
-
 
 /// Returns \c true if \p Tok is the name of a declared entity, as in `char
 /// *argv`, `char **argv_real` or `void (*functionPointer)()`. A name that holds
@@ -7429,6 +7401,32 @@ bool isInTrailingReturnType(const FormatToken &PointerOrReference) {
   return false;
 }
 
+/// Returns \c true if \p PointerOrReference is written inside a cast, as in
+/// `reinterpret_cast<void *const*>(p)` or `(char *)p`. The type named by a cast
+/// is an isolated type, so it is compacted like any other one.
+bool isInCast(const FormatToken &PointerOrReference) {
+  // A named cast, as in `reinterpret_cast<void *>(p)`, opens a template
+  // argument list with a `<` that stands in front of the token.
+  for (const FormatToken *Tok = &PointerOrReference; Tok;
+       Tok = Tok->getPreviousNonComment()) {
+    if (Tok->isOneOf(tok::semi, tok::l_brace, tok::r_brace, tok::equal))
+      break;
+    if (Tok->is(tok::less) && Tok->Previous &&
+        Tok->Previous->isOneOf(tok::kw_reinterpret_cast, tok::kw_static_cast,
+                               tok::kw_const_cast, tok::kw_dynamic_cast))
+      return true;
+  }
+  // A C style cast, as in `(char *)p`, ends with a cast parenthesis.
+  for (const FormatToken *Tok = PointerOrReference.getPreviousNonComment(); Tok;
+       Tok = Tok->getPreviousNonComment()) {
+    if (Tok->isOneOf(tok::semi, tok::l_brace, tok::r_brace, tok::equal))
+      break;
+    if (Tok->is(TT_CastRParen))
+      return true;
+  }
+  return false;
+}
+
 /// Returns \c true if \p PointerOrReference is written in the parameter list of
 /// a template declaration, as in `template <int *P>`. Such a list declares
 /// names and is therefore left to the configured alignment.
@@ -7451,11 +7449,6 @@ bool isInTemplateParameterList(const FormatToken &PointerOrReference) {
 bool isIsolatedTypePointerOrReference(const AnnotatedLine &Line,
                                       const FormatToken &PointerOrReference,
                                       const LangOptions &LangOpts) {
-  // A cast is an expression, not a type annotation, so its type is left as it
-  // is. `void *const*` in `reinterpret_cast<void *const*>(p)` is an example.
-  if (isInCast(PointerOrReference))
-    return false;
-
   // A trailing return type, as in `auto f() -> const char *`, is not affected.
   if (isInTrailingReturnType(PointerOrReference))
     return false;
@@ -7468,26 +7461,29 @@ bool isIsolatedTypePointerOrReference(const AnnotatedLine &Line,
   if (!Next)
     return false;
 
-  // A '*'/'&' that is directly followed by another pointer or reference symbol
-  // is the start of a multi level declarator such as `char **argv`, so it must
-  // not be moved. The end of the type is reached by the last symbol.
-  if (PointerOrReference.Next &&
-      PointerOrReference.Next->isPointerOrReference())
-    return false;
-  // `char *const` is an abstract type even though a name may follow it.
+  // `char *const` is not a trailing symbol of the type, so the '*'/'&' stays
+  // where it is. Moving it would shift the space behind the symbol, turning
+  // `void *const*` into `void* const*`.
   if (Next->canBePointerOrReferenceQualifier())
+    return false;
+
+  // A multi level type such as `void**` or `char **argv` is judged by the token
+  // that follows the whole run of pointer and reference symbols, so that the
+  // run is either compacted as a whole or left alone as a whole.
+  while (Next->isPointerOrReference() ||
+         Next->canBePointerOrReferenceQualifier())
     Next = Next->getNextNonComment();
   if (!Next)
     return false;
 
   // Anything that is not an identifier cannot be the name of a declarator, so
-  // the '*'/'&' ends a type. This covers the unnamed parameters of
-  // `void f(LPVOID, LPVOID arg, LPVOID *)`.
+  // the run ends a type. This covers the unnamed parameters of
+  // `void f(LPVOID, LPVOID arg, LPVOID *)` and isolated types such as `void**`.
   if (!Next->Tok.isAnyIdentifier())
     return true;
 
-  // A name in lower case behind the '*'/'&' shows that this is a declarator, as
-  // in `char **argv` or `char **argv_real`.
+  // A name in lower case behind the run shows that this is a declarator, as in
+  // `char **argv` or `char **argv_real`.
   if (looksLikeDeclaredName(*Next))
     return false;
   // A name in upper case is the usual spelling of a type, as in
@@ -7521,9 +7517,11 @@ bool TokenAnnotator::mustAttachPointerOrReferenceToType(
   if (PointerOrReference.Next->isOneOf(tok::l_square, tok::r_square))
     return false;
 
-  // A cast is an expression, so the type in it is left untouched.
+  // The `<...>` of a cast is not a template argument list, so a cast is routed
+  // to the isolated type rule, which keeps a symbol that is followed by a
+  // qualifier, as in `void *const*`, in place.
   if (isInCast(PointerOrReference))
-    return false;
+    return isIsolatedTypePointerOrReference(Line, PointerOrReference, LangOpts);
 
   // 1. The return type of a function declaration or definition, except for
   //    trailing return types such as `auto f() -> const T *`.
