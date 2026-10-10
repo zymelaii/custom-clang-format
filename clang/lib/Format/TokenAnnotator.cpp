@@ -5276,7 +5276,7 @@ bool TokenAnnotator::spaceRequiredBetween(const AnnotatedLine &Line,
              FormatStyle::PAS_Right;
     }
     if (Right.isOneOf(TT_PointerOrReference, TT_ArraySubscriptLSquare,
-                      tok::l_paren)) {
+                      tok::l_paren, tok::l_square)) {
       return false;
     }
     if (getTokenPointerOrReferenceAlignment(Left) == FormatStyle::PAS_Right)
@@ -7484,6 +7484,25 @@ bool isInTemplateParameterList(const FormatToken &PointerOrReference) {
   return false;
 }
 
+/// Returns \c true if \p PointerOrReference belongs to a structured binding
+/// declaration, as in `const auto &[a, b] : v`. Such a declaration declares
+/// names and is left to the configured alignment.
+bool isInStructuredBinding(const FormatToken &PointerOrReference) {
+  if (!PointerOrReference.Next ||
+      PointerOrReference.Next->isNot(tok::l_square))
+    return false;
+  // The declaration of a structured binding names `auto`, as in `auto &[a, b]`
+  // or `const auto &&[a, b]`. An array of pointers, as in `char *[]`, does not.
+  for (const FormatToken *Tok = PointerOrReference.getPreviousNonComment(); Tok;
+       Tok = Tok->getPreviousNonComment()) {
+    if (Tok->is(tok::kw_auto))
+      return true;
+    if (!Tok->canBePointerOrReferenceQualifier())
+      return false;
+  }
+  return false;
+}
+
 /// Returns \c true if \p PointerOrReference completes an isolated type, i.e. if
 /// no name is declared through it. A '*'/'&' that introduces the name of a
 /// declared entity, as in `char *name`, `char **argv` or `char **argv_real`, is
@@ -7556,7 +7575,7 @@ bool TokenAnnotator::mustAttachPointerOrReferenceToType(
     return false;
   // `const auto &[a, b]` is a structured binding, i.e. a declaration, and is
   // left to the pointer and reference alignment of the style.
-  if (PointerOrReference.Next->isOneOf(tok::l_square, tok::r_square))
+  if (isInStructuredBinding(PointerOrReference))
     return false;
 
   // The `<...>` of a cast is not a template argument list, so a cast is routed
