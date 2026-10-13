@@ -1250,9 +1250,12 @@ protected:
       return false;
 
     // If the child line exceeds the column limit, we wouldn't want to merge it.
-    // We add +2 for the trailing " }".
+    // We add +2 for the trailing " }". A lambda body that the custom rules force
+    // onto a single line is merged anyway, as it may not break at all.
     if (Style.ColumnLimit > 0 &&
-        Child->Last->TotalLength + State.Column + 2 > Style.ColumnLimit) {
+        Child->Last->TotalLength + State.Column + 2 > Style.ColumnLimit &&
+        !(Previous.is(TT_LambdaLBrace) &&
+          Previous.KeepLambdaBodyOnSingleLine)) {
       return false;
     }
 
@@ -1339,6 +1342,9 @@ public:
                           UnwrappedLineFormatter *BlockFormatter)
       : LineFormatter(Indenter, Whitespaces, Style, BlockFormatter) {}
 
+  /// Whether the last call to \c formatLine could not find a solution at all.
+  bool Failed = false;
+
   /// Formats the line by finding the best line breaks with line lengths
   /// below the column limit.
   unsigned formatLine(const AnnotatedLine &Line, unsigned FirstIndent,
@@ -1352,6 +1358,7 @@ public:
       State.Stack.back().BreakBeforeParameter = true;
 
     // Find best solution in solution space.
+    Failed = false;
     return analyzeSolutionSpace(State, DryRun);
   }
 
@@ -1415,8 +1422,10 @@ private:
     // While not empty, take first element and follow edges.
     while (!Queue.empty()) {
       // Quit if we still haven't found a solution by now.
-      if (Count > 25'000'000)
+      if (Count > 25'000'000) {
+        Failed = true;
         return 0;
+      }
 
       Penalty = Queue.top().first.first;
       StateNode *Node = Queue.top().second;
@@ -1447,6 +1456,7 @@ private:
     if (Queue.empty()) {
       // We were unable to find a solution, do nothing.
       // FIXME: Add diagnostic?
+      Failed = true;
       LLVM_DEBUG(llvm::dbgs() << "Could not find a solution.\n");
       return 0;
     }
@@ -1511,6 +1521,23 @@ private:
 
   llvm::SpecificBumpPtrAllocator<StateNode> Allocator;
 };
+
+/// Returns \c true if any token of \p Line or of one of its children was marked
+/// by one of the custom rules.
+bool usesCustomRules(const AnnotatedLine &Line) {
+  for (const FormatToken *Tok = Line.First; Tok; Tok = Tok->Next) {
+    if (Tok->KeepWithPreviousToken || Tok->KeepLambdaBodyOnSingleLine ||
+        Tok->PreferLambdaBodyOnSingleLine || Tok->BreakLambdaBodyBefore ||
+        Tok->BreakLambdaBodyAfter || Tok->ForcedBreakByCustomRule ||
+        Tok->HasLambdaBodyIndentOverride ||
+        Tok->ForcedPointerOrReferenceAlignment.has_value())
+      return true;
+    for (const AnnotatedLine *Child : Tok->Children)
+      if (usesCustomRules(*Child))
+        return true;
+  }
+  return false;
+}
 
 } // anonymous namespace
 
@@ -1594,9 +1621,20 @@ unsigned UnwrappedLineFormatter::format(
                        .formatLine(TheLine, NextStartColumn + Indent,
                                    FirstLine ? FirstStartColumn : 0, DryRun);
       } else {
-        Penalty += OptimizingLineFormatter(Indenter, Whitespaces, Style, this)
-                       .formatLine(TheLine, NextStartColumn + Indent,
-                                   FirstLine ? FirstStartColumn : 0, DryRun);
+        OptimizingLineFormatter Formatter(Indenter, Whitespaces, Style, this);
+        Penalty += Formatter.formatLine(TheLine, NextStartColumn + Indent,
+                                        FirstLine ? FirstStartColumn : 0,
+                                        DryRun);
+        // The custom rules describe the formatting the style asks for. If the
+        // column limit makes it impossible to satisfy them, the column limit
+        // has to give way: format the line once more with the input's line
+        // breaks instead of leaving it completely unformatted.
+        if (Formatter.Failed && !DryRun && usesCustomRules(TheLine)) {
+          Penalty +=
+              NoColumnLimitLineFormatter(Indenter, Whitespaces, Style, this)
+                  .formatLine(TheLine, NextStartColumn + Indent,
+                              FirstLine ? FirstStartColumn : 0, DryRun);
+        }
       }
       RangeMinLevel = std::min(RangeMinLevel, TheLine.Level);
     } else {

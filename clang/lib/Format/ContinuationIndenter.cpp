@@ -456,6 +456,9 @@ bool ContinuationIndenter::canBreak(const LineState &State) {
       // Same for the opening brace of requires expressions.
       (!Style.BraceWrapping.AfterRequiresExpression ||
        Current.isNot(TT_RequiresExpressionLBrace)) &&
+      // Custom rule: a break that one of the custom rules forced has to be
+      // allowed, even though the token stands inside an operand.
+      !Current.ForcedBreakByCustomRule &&
       CurrentState.NoLineBreakInOperand) {
     return false;
   }

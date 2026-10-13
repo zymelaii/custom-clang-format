@@ -4247,22 +4247,29 @@ bool getLambdaBody(FormatToken &Introducer, LambdaBody &Body) {
 }
 
 /// Returns \c true if \p Tok belongs to a lambda body that has to stay on a
-/// single line, including its closing brace.
+/// single line, including its closing brace. The tokens of the body are marked
+/// when the rule is applied, so that the body may not break internally either.
 bool isInSingleLineLambdaBody(const FormatToken &Tok) {
-  if (Tok.is(tok::r_brace) && Tok.MatchingParen &&
-      Tok.MatchingParen->is(TT_LambdaLBrace) &&
-      Tok.MatchingParen->KeepLambdaBodyOnSingleLine)
+  if (Tok.KeepLambdaBodyOnSingleLine)
     return true;
-  const unsigned Level = Tok.NestingLevel;
-  for (const auto *Prev = Tok.getPreviousNonComment(); Prev;
-       Prev = Prev->getPreviousNonComment()) {
-    if (Prev->NestingLevel < Level)
-      return Prev->is(TT_LambdaLBrace) && Prev->KeepLambdaBodyOnSingleLine &&
-             Prev->MatchingParen != nullptr;
-    if (Prev->NestingLevel == Level)
-      break;
+  return Tok.is(tok::r_brace) && Tok.MatchingParen &&
+         Tok.MatchingParen->is(TT_LambdaLBrace) &&
+         Tok.MatchingParen->KeepLambdaBodyOnSingleLine;
+}
+
+/// Marks every token of the body that belongs to \p BodyBrace, so that the body
+/// stays on the line of its opening brace.
+void markSingleLineLambdaBody(const FormatToken &BodyBrace,
+                              const FormatToken &ClosingBrace) {
+  if (BodyBrace.Next && BodyBrace.Next != &ClosingBrace)
+    BodyBrace.Next->KeepLambdaBodyOnSingleLine = true;
+  for (const AnnotatedLine *Child : BodyBrace.Children) {
+    for (FormatToken *Tok = Child->First; Tok; Tok = Tok->Next) {
+      if (Tok->isNot(tok::comment))
+        Tok->KeepLambdaBodyOnSingleLine = true;
+      markSingleLineLambdaBody(*Tok, ClosingBrace);
+    }
   }
-  return false;
 }
 
 /// Returns \c true if \p Tok or one of its children holds a token that prevents
@@ -4307,6 +4314,17 @@ bool lambdaSignatureHasLineComment(const FormatToken &Introducer,
       return true;
   }
   return false;
+}
+
+/// Returns \c true if the body of a lambda holds a block of its own, as in
+/// `[&] { if (x) { y(); } }`. The formatter keeps such a body on several lines
+/// and cannot join them again, so the body may not be forced onto a single line.
+bool lambdaBodyHasBlock(const FormatToken &BodyBrace) {
+  const auto &Children = BodyBrace.Children;
+  if (Children.size() > 1)
+    return true;
+  // A single line that ends in an opening brace starts a block of its own.
+  return !Children.empty() && Children[0]->Last->is(tok::l_brace);
 }
 
 /// Returns \c true if no space is written in front of \p Tok when it directly
@@ -4360,9 +4378,12 @@ void annotateLambdaRules(AnnotatedLine &Line, const FormatStyle &Style) {
 
     // Makes the signature of the lambda, i.e. everything up to the body brace,
     // unbreakable so that it stays on the line of the assignment it belongs to.
-    auto KeepSignatureTogether = [&] {
-      for (FormatToken *Tok = Introducer; Tok && Tok != Body.Brace;
-           Tok = Tok->Next) {
+    // With \p KeepIntroducer the lambda may not even start a line of its own;
+    // rule 1 only requires the body to stay on a single line, so that the call
+    // it is an argument of can still be broken in front of it.
+    auto KeepSignatureTogether = [&](bool KeepIntroducer = true) {
+      for (FormatToken *Tok = KeepIntroducer ? Introducer : Introducer->Next;
+           Tok && Tok != Body.Brace; Tok = Tok->Next) {
         if (Tok->isNot(tok::comment)) {
           Tok->CanBreakBefore = false;
           Tok->KeepWithPreviousToken = true;
@@ -4379,11 +4400,26 @@ void annotateLambdaRules(AnnotatedLine &Line, const FormatStyle &Style) {
         !lambdaBodyMustStayMultiLine(*Body.Brace) &&
         !lambdaSignatureHasLineComment(*Introducer, *Body.Brace);
 
+    // A body that holds a block of its own, as in `{ if (x) { y(); } }`, is
+    // split into several lines by the formatter, which cannot join them again.
+    // Forcing the brace to stay would leave the layout search without any
+    // solution, so such a body is left to the rules below.
+    // A body that holds a block of its own, as in `{ if (x) { y(); } }`, is
+    // split into several lines by the formatter, which cannot join them again.
+    // Forcing the brace to stay would leave the layout search without any
+    // solution, so such a body is left to the rules below.
+    const bool BodyCanBeMerged =
+        !lambdaBodyHasBlock(*Body.Brace) && Body.Brace->Children.size() <= 1;
+
+
     // Rule 1: at most one statement keeps the whole lambda on a single line,
-    // ignoring every other condition.
-    if (Body.Statements <= 1 && BodyCanBeInline) {
+    // ignoring every other condition. A lambda that is an argument may still
+    // start a line of its own, as the call it belongs to otherwise has no place
+    // left to break at.
+    if (Body.Statements <= 1 && BodyCanBeInline && BodyCanBeMerged) {
       Body.Brace->KeepLambdaBodyOnSingleLine = true;
-      KeepSignatureTogether();
+      markSingleLineLambdaBody(*Body.Brace, *Body.ClosingBrace);
+      KeepSignatureTogether(/*KeepIntroducer=*/!Argument);
       Body.Brace->MustBreakBefore = false;
       Body.Brace->CanBreakBefore = false;
       Body.ClosingBrace->MustBreakBefore = false;
@@ -4414,6 +4450,7 @@ void annotateLambdaRules(AnnotatedLine &Line, const FormatStyle &Style) {
       // Rule 4: the lambda fits, so it is not allowed to break at all and is
       // embedded in the function call on a single line.
       Body.Brace->KeepLambdaBodyOnSingleLine = true;
+      markSingleLineLambdaBody(*Body.Brace, *Body.ClosingBrace);
       KeepSignatureTogether();
       Body.Brace->MustBreakBefore = false;
       Body.Brace->CanBreakBefore = false;
@@ -4747,6 +4784,13 @@ void TokenAnnotator::calculateFormattingInformation(AnnotatedLine &Line) const {
     return;
 
   Line.Computed = true;
+
+  // The custom rules of this line are decided before the lines of its children
+  // are formatted: a lambda body is such a child line and has to know whether it
+  // stays on the line of its opening brace.
+  annotateLambdaRules(Line, Style);
+  annotateChainBreaks(Line);
+  annotateFunctionHead(Line, LangOpts);
 
   for (AnnotatedLine *ChildLine : Line.Children)
     calculateFormattingInformation(*ChildLine);
